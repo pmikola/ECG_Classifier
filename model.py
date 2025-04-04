@@ -1,89 +1,79 @@
-import math
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 
-class SpectralConv1d(nn.Module):
-    def __init__(self, in_channels, out_channels, modes):
+class InceptionModule1d(nn.Module):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes = modes
-        self.scale = 1.0 / (in_channels * out_channels)
-        self.weights = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, modes, dtype=torch.cfloat))
+        self.branch1 = nn.Conv1d(in_channels, out_channels // 4, kernel_size=1)
+        self.branch2 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels // 4, kernel_size=1),
+            nn.Conv1d(out_channels // 4, out_channels // 4, kernel_size=3, padding=1)
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels // 4, kernel_size=1),
+            nn.Conv1d(out_channels // 4, out_channels // 4, kernel_size=5, padding=2)
+        )
+        self.branch4 = nn.Sequential(
+            nn.MaxPool1d(kernel_size=3, stride=1, padding=1),
+            nn.Conv1d(in_channels, out_channels // 4, kernel_size=1)
+        )
+        self.act = nn.SiLU()
 
     def forward(self, x):
-        batch_size, in_channels, n = x.shape
-        pos_enc = self.positional_encoding(n, x.device)
-        x = x + pos_enc
-        x_ft = torch.fft.fft(x, dim=-1)
-        out_ft = torch.zeros(batch_size, self.out_channels, x_ft.shape[-1], dtype=torch.cfloat, device=x.device)
-        out_ft[..., :self.modes] = torch.einsum("bim, ioj -> bom", x_ft[..., :self.modes], self.weights)
-        x_out = torch.fft.ifft(out_ft, n, dim=-1).real
-        return x_out
+        out1 = self.branch1(x)
+        out2 = self.branch2(x)
+        out3 = self.branch3(x)
+        out4 = self.branch4(x)
+        return self.act(torch.cat([out1, out2, out3, out4], dim=1))
 
-    @staticmethod
-    def positional_encoding(n, device):
-        position = torch.arange(n//2, dtype=torch.float32, device=device)
-        div_term = torch.exp(torch.arange(0, n, 2, device=device) * (-math.log(10000.0) / n))
-        pe = torch.zeros(1, 1, n, device=device)
-        pe[..., 0::2] = torch.sin(position * div_term)
-        pe[..., 1::2] = torch.cos(position * div_term)
-        return pe
-
-class EcgFNOClassifier(nn.Module):
-    def __init__(self, number_of_points, modes, width, no_labels):
+class ECGClassifier(nn.Module):
+    def __init__(self, no_labels):
         super().__init__()
-        self.modes = modes
-        self.width = width
-        self.no_labels = no_labels
-        self.no_points = number_of_points
-        self.lift = nn.Linear(1, width)
-        self.dropout = nn.Dropout(0.2)
-        self.sconv1 = SpectralConv1d(width, width, modes)
-        self.w1 = nn.Conv1d(width, width, kernel_size=1)
-        self.conv1 = nn.Conv1d(width, width // 2, kernel_size=3, padding=1)
-        self.sconv2 = SpectralConv1d(width // 2, width // 2, modes)
-        self.w2 = nn.Conv1d(width // 2, width // 2, kernel_size=1)
-        self.sconv3 = SpectralConv1d(width // 2, width // 2, modes)
-        self.w3 = nn.Conv1d(width // 2, width // 2, kernel_size=1)
-        self.pool = nn.AdaptiveAvgPool1d(4)
-        self.downlift = nn.Linear((width // 2) * 4, width // 4)
-        self.head = nn.Linear(width // 4, no_labels)
+        self.lift = nn.Conv1d(1, 128, kernel_size=1)
+        self.act = nn.SiLU()
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        self.inception1 = InceptionModule1d(128, 256)
+        self.res1 = nn.Conv1d(128, 256, kernel_size=1)
+        self.inception2 = InceptionModule1d(256, 512)
+        self.res2 = nn.Conv1d(256, 512, kernel_size=1)
+        self.inception3 = InceptionModule1d(512, 1024)
+        self.res3 = nn.Conv1d(512, 1024, kernel_size=1)
+        self.inception4 = InceptionModule1d(1024, 2048)
+        self.res4 = nn.Conv1d(1024, 2048, kernel_size=1)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(0.1)
+        self.fc0 = nn.Linear(2048, 1024)
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.head = nn.Linear(256, no_labels)
 
     def forward(self, x):
-        x = x.unsqueeze(-1)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
         x = self.lift(x)
         x = self.act(x)
+        x = self.maxpool(x)
+        residual = self.res1(x)
+        x = self.inception1(x)
+        x = x + residual
+        residual = self.res2(x)
+        x = self.inception2(x)
+        x = x + residual
+        residual = self.res3(x)
+        x = self.inception3(x)
+        x = x + residual
+        residual = self.res4(x)
+        x = self.inception4(x)
+        x = x + residual
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
         x = self.dropout(x)
-        x = x.permute(0, 2, 1)
-        r = x
-        x1 = self.sconv1(x)
-        x2 = self.w1(x)
-        x = x1 + x2
-        x = self.act(x + r)
-        x = self.dropout(x)
-        x = self.conv1(x)
+        x = self.fc0(x)
         x = self.act(x)
-        x = self.dropout(x)
-        r = x
-        x1 = self.sconv2(x)
-        x2 = self.w2(x)
-        x = x1 + x2
-        x = self.act(x + r)
-        x = self.dropout(x)
-        r = x
-        x1 = self.sconv3(x)
-        x2 = self.w3(x)
-        x = self.act(x1 + x2 + r)
-        x = self.dropout(x)
-        x = self.pool(x)
-        x = x.reshape(x.shape[0], -1)
-        x = self.downlift(x)
+        x = self.fc1(x)
         x = self.act(x)
-        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.act(x)
         x = self.head(x)
         return x
-
-    @staticmethod
-    def act(x):
-        return torch.relu(x)

@@ -15,7 +15,7 @@ import torch
 from torch import nn, optim
 import torch.nn.functional as F
 import torch.cuda.amp as amp
-from model import EcgFNOClassifier
+from model import  ECGClassifier
 
 matplotlib.use('TkAgg')
 
@@ -104,16 +104,16 @@ train_int_labels = torch.argmax(y_train_t, dim=1)
 indices_by_class = {c: (train_int_labels == c).nonzero(as_tuple=True)[0] for c in range(num_classes)}
 
 num_epochs = 10000
-batch_size = 64
+batch_size = 32
 lead_view = 0
 modes = 5
 hidden_width = 200
 number_of_points = 1000
-model = EcgFNOClassifier(number_of_points, modes, hidden_width, num_classes).to(device)
+model = ECGClassifier( num_classes).to(device)
 print('Model Parameters: ', count_parameters(model))
 criterion = nn.CrossEntropyLoss()
 # criterion = FocalLoss(gamma=2.0)
-optimizer = optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5, amsgrad=True)
+optimizer = optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=5e-6, amsgrad=True)
 
 train_loss_history = []
 test_loss_history  = []
@@ -121,6 +121,25 @@ train_acc_history  = []
 test_acc_history   = []
 
 start_block_time = time.time()
+
+def augment_data(data):
+    noise_std = 0.01
+    noise = torch.randn_like(data) * noise_std
+    data_noisy = data + noise
+    num_segments = 4
+    batch_size, channels, length = data_noisy.shape
+    segment_length = length // num_segments
+    if segment_length > 0:
+        segments = []
+        for i in range(num_segments):
+            start = i * segment_length
+            end = start + segment_length if i < num_segments - 1 else length
+            segments.append(data_noisy[:, :, start:end])
+        perm = torch.randperm(num_segments, device=data_noisy.device)
+        data_permuted = torch.cat([segments[i] for i in perm], dim=2)
+    else:
+        data_permuted = data_noisy
+    return data_permuted
 
 for epoch in range(num_epochs):
     samples_per_class = batch_size // num_classes
@@ -141,6 +160,8 @@ for epoch in range(num_epochs):
 
     train_data_sample = X_train_t[random_train_indices, :, lead_view]
     train_label_sample = y_train_t[random_train_indices]
+
+    train_data_sample = augment_data(train_data_sample)
 
     test_data_sample = X_test_t[random_test_indices, :, lead_view]
     test_label_sample = y_test_t[random_test_indices]
@@ -206,7 +227,7 @@ axs[1].set_title('Training and Test Accuracy')
 axs[1].legend()
 axs[1].grid(True)
 
-fig.suptitle("ECG FNO Classifier Results", fontsize=16)
+fig.suptitle("ECG Classifier Results", fontsize=16)
 plt.tight_layout()
 plt.show()
 
