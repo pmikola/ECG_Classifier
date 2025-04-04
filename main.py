@@ -19,6 +19,23 @@ from model import EcgFNOClassifier
 
 matplotlib.use('TkAgg')
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='mean')
+        pt = torch.exp(-ce_loss)
+        loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
 
 def load_raw_data(df, sampling_rate, path):
     if sampling_rate == 100:
@@ -83,33 +100,44 @@ y_test_ohe  = np.array([one_hot_encode(labels, num_classes) for labels in y_test
 y_train_t = torch.tensor(y_train_ohe, dtype=torch.float32, device=device)
 y_test_t  = torch.tensor(y_test_ohe,  dtype=torch.float32, device=device)
 
-##############################################################################
-# Note: Set up the model
-##############################################################################
+train_int_labels = torch.argmax(y_train_t, dim=1)
+indices_by_class = {c: (train_int_labels == c).nonzero(as_tuple=True)[0] for c in range(num_classes)}
+
 num_epochs = 10000
 batch_size = 64
 lead_view = 0
-modes = 7
-hidden_width = 100
+modes = 5
+hidden_width = 200
 number_of_points = 1000
-model = EcgFNOClassifier(number_of_points,modes, hidden_width, num_classes).to(device)
-print('Model Parameters: ',count_parameters(model))
+model = EcgFNOClassifier(number_of_points, modes, hidden_width, num_classes).to(device)
+print('Model Parameters: ', count_parameters(model))
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=5e-4)
+# criterion = FocalLoss(gamma=2.0)
+optimizer = optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5, amsgrad=True)
 
 train_loss_history = []
 test_loss_history  = []
 train_acc_history  = []
 test_acc_history   = []
 
-#############################################################################
-# Note: Train loop
-##############################################################################
 start_block_time = time.time()
 
 for epoch in range(num_epochs):
-    random_train_indices = torch.randperm(X_train_t.shape[0], device=device)[:batch_size]
-    random_test_indices  = torch.randperm(X_test_t.shape[0],  device=device)[:batch_size]
+    samples_per_class = batch_size // num_classes
+    remainder = batch_size % num_classes
+    balanced_indices = []
+    for c in range(num_classes):
+        idx = indices_by_class[c]
+        chosen = idx[torch.randint(0, idx.shape[0], (samples_per_class,), device=device)]
+        balanced_indices.append(chosen)
+    for i in range(remainder):
+        c = i % num_classes
+        idx = indices_by_class[c]
+        chosen = idx[torch.randint(0, idx.shape[0], (1,), device=device)]
+        balanced_indices.append(chosen)
+    random_train_indices = torch.cat(balanced_indices)
+    random_train_indices = random_train_indices[torch.randperm(random_train_indices.shape[0], device=device)]
+    random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:batch_size]
 
     train_data_sample = X_train_t[random_train_indices, :, lead_view]
     train_label_sample = y_train_t[random_train_indices]
@@ -119,7 +147,7 @@ for epoch in range(num_epochs):
 
     model.train()
     train_outputs = model(train_data_sample)
-    train_loss = criterion(train_outputs, train_label_sample)
+    train_loss = criterion(train_outputs, torch.argmax(train_label_sample, dim=1))
 
     optimizer.zero_grad()
     train_loss.backward()
@@ -130,11 +158,10 @@ for epoch in range(num_epochs):
     train_correct = (train_preds == train_label_indices).sum().item()
     train_acc = train_correct / train_label_indices.size(0)
 
-    # Evaluate
     model.eval()
     with torch.no_grad():
         test_outputs = model(test_data_sample)
-        test_loss = criterion(test_outputs, test_label_sample)
+        test_loss = criterion(test_outputs, torch.argmax(test_label_sample, dim=1))
 
     test_label_indices = torch.argmax(test_label_sample, dim=1)
     _, test_preds = torch.max(test_outputs, dim=1)
@@ -156,20 +183,16 @@ for epoch in range(num_epochs):
             f"Train Loss: {train_loss.item():.4f} | "
             f"Test Loss: {test_loss.item():.4f} | "
             f"Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f} | "
-            f"Mean Time/Epoch (last 50): {mean_block_time:.3f}s"
-        )
+            f"Mean Time/Epoch: {mean_block_time:.3f}s")
         start_block_time = time.time()
 
-##############################################################################
-# Note: Plot losses / accuracies
-##############################################################################
 plt.style.use('dark_background')
 
 fig, axs = plt.subplots(1, 2, figsize=(8, 4))
 
 axs[0].plot(train_loss_history, label='Train Loss')
 axs[0].plot(test_loss_history, label='Test Loss')
-axs[0].set_xlabel('Checkpoints (every 10 epochs)')
+axs[0].set_xlabel('Epoch')
 axs[0].set_ylabel('Loss')
 axs[0].set_title('Training and Test Loss')
 axs[0].legend()
@@ -177,7 +200,7 @@ axs[0].grid(True)
 
 axs[1].plot(train_acc_history, label='Train Accuracy')
 axs[1].plot(test_acc_history, label='Test Accuracy')
-axs[1].set_xlabel('Checkpoints (every 10 epochs)')
+axs[1].set_xlabel('Epoch')
 axs[1].set_ylabel('Accuracy')
 axs[1].set_title('Training and Test Accuracy')
 axs[1].legend()
@@ -187,9 +210,6 @@ fig.suptitle("ECG FNO Classifier Results", fontsize=16)
 plt.tight_layout()
 plt.show()
 
-##############################################################################
-# Note: Confusion matrix on a subset of test data
-##############################################################################
 model.eval()
 no_samples_conf_matrix = 1000
 with torch.no_grad():
