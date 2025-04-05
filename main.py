@@ -1,7 +1,6 @@
 import ast
 import sys
 import time
-
 import matplotlib
 import wfdb
 from mpl_toolkits.mplot3d import Axes3D
@@ -10,32 +9,43 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import pandas as pd
-
 import torch
 from torch import nn, optim
 import torch.nn.functional as F
 import torch.cuda.amp as amp
-from model import  ECGClassifier
+from model import ECGClassifier
 
 matplotlib.use('TkAgg')
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
+    def __init__(self, gamma=2.0, num_classes=None, reduction='mean'):
         super().__init__()
         self.gamma = gamma
-        self.weight = weight
         self.reduction = reduction
-
+        if num_classes is not None:
+            self.class_weights = nn.Parameter(torch.ones(num_classes, device=torch.device('cuda')))
+        else:
+            self.class_weights = None
     def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='mean')
-        pt = torch.exp(-ce_loss)
-        loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.class_weights is not None:
+            weight = torch.softmax(self.class_weights, dim=0)
+        else:
+            weight = None
+        log_probs = F.log_softmax(inputs, dim=1)
+        probs = torch.exp(log_probs)
+        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal_factor = (1 - pt) ** self.gamma
+        if weight is not None:
+            sample_weight = weight[targets]
+        else:
+            sample_weight = 1.0
+        loss = - sample_weight * focal_factor * log_pt
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
             return loss.sum()
         return loss
-
 
 def load_raw_data(df, sampling_rate, path):
     if sampling_rate == 100:
@@ -61,8 +71,7 @@ def one_hot_encode(labels, num_classes):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda')
 print("Using device:", device)
 
 path = 'ptb-xl-dataset/'
@@ -75,7 +84,6 @@ X = load_raw_data(Y, sampling_rate, path)
 
 agg_df = pd.read_csv(path+'scp_statements.csv', index_col=0)
 agg_df = agg_df[agg_df.diagnostic == 1]
-
 
 Y['diagnostic_superclass'] = Y.scp_codes.apply(aggregate_diagnostic)
 
@@ -107,13 +115,12 @@ num_epochs = 10000
 batch_size = 32
 lead_view = 0
 modes = 5
-hidden_width = 200
-number_of_points = 1000
-model = ECGClassifier( num_classes).to(device)
+seq_len = 1000
+model = ECGClassifier(num_classes, seq_len).to(device)
 print('Model Parameters: ', count_parameters(model))
-criterion = nn.CrossEntropyLoss()
-# criterion = FocalLoss(gamma=2.0)
-optimizer = optim.Adam(model.parameters(), lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=5e-6, amsgrad=True)
+criterion = FocalLoss(gamma=2.0, num_classes=num_classes)
+optimizer = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=5e-6, amsgrad=True)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)
 
 train_loss_history = []
 test_loss_history  = []
@@ -123,23 +130,36 @@ test_acc_history   = []
 start_block_time = time.time()
 
 def augment_data(data):
-    noise_std = 0.01
-    noise = torch.randn_like(data) * noise_std
-    data_noisy = data + noise
-    num_segments = 4
-    batch_size, channels, length = data_noisy.shape
-    segment_length = length // num_segments
-    if segment_length > 0:
-        segments = []
-        for i in range(num_segments):
-            start = i * segment_length
-            end = start + segment_length if i < num_segments - 1 else length
-            segments.append(data_noisy[:, :, start:end])
-        perm = torch.randperm(num_segments, device=data_noisy.device)
-        data_permuted = torch.cat([segments[i] for i in perm], dim=2)
-    else:
-        data_permuted = data_noisy
-    return data_permuted
+    if data.ndim == 2:
+        data = data.unsqueeze(1)
+    aug = torch.randint(0, 4, (1,), device=device).item()
+    if aug == 0:
+        noise_std = 0.01
+        noise = torch.randn_like(data) * noise_std
+        return data + noise
+    elif aug == 1:
+        shift = torch.randint(-10, 10, (1,), device=device).item()
+        return data.roll(shift, dims=-1)
+    elif aug == 2:
+        scale = torch.empty(1, device=device).uniform_(0.9, 1.1).item()
+        return data * scale
+    elif aug == 3:
+        noise_std = 0.01
+        noise = torch.randn_like(data, device=device) * noise_std
+        data_noisy = data + noise
+        num_segments = 4
+        batch_size, channels, length = data_noisy.shape
+        segment_length = length // num_segments
+        if segment_length > 0:
+            segments = []
+            for i in range(num_segments):
+                start = i * segment_length
+                end = start + segment_length if i < num_segments - 1 else length
+                segments.append(data_noisy[:, :, start:end])
+            perm = torch.randperm(num_segments, device=device)
+            return torch.cat([segments[i] for i in perm], dim=2)
+        else:
+            return data_noisy
 
 for epoch in range(num_epochs):
     samples_per_class = batch_size // num_classes
@@ -157,60 +177,44 @@ for epoch in range(num_epochs):
     random_train_indices = torch.cat(balanced_indices)
     random_train_indices = random_train_indices[torch.randperm(random_train_indices.shape[0], device=device)]
     random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:batch_size]
-
     train_data_sample = X_train_t[random_train_indices, :, lead_view]
     train_label_sample = y_train_t[random_train_indices]
-
     train_data_sample = augment_data(train_data_sample)
-
     test_data_sample = X_test_t[random_test_indices, :, lead_view]
     test_label_sample = y_test_t[random_test_indices]
-
     model.train()
     train_outputs = model(train_data_sample)
     train_loss = criterion(train_outputs, torch.argmax(train_label_sample, dim=1))
-
     optimizer.zero_grad()
     train_loss.backward()
     optimizer.step()
-
     train_label_indices = torch.argmax(train_label_sample, dim=1)
     _, train_preds = torch.max(train_outputs, dim=1)
     train_correct = (train_preds == train_label_indices).sum().item()
     train_acc = train_correct / train_label_indices.size(0)
-
     model.eval()
     with torch.no_grad():
         test_outputs = model(test_data_sample)
         test_loss = criterion(test_outputs, torch.argmax(test_label_sample, dim=1))
-
     test_label_indices = torch.argmax(test_label_sample, dim=1)
     _, test_preds = torch.max(test_outputs, dim=1)
     test_correct = (test_preds == test_label_indices).sum().item()
     test_acc = test_correct / test_label_indices.size(0)
-
     if epoch % 10 == 0:
         train_loss_history.append(train_loss.item())
         test_loss_history.append(test_loss.item())
         train_acc_history.append(train_acc)
         test_acc_history.append(test_acc)
-
     if epoch % 50 == 0 and epoch > 0:
         end_block_time = time.time()
         block_elapsed = end_block_time - start_block_time
         mean_block_time = block_elapsed / 50.0
-        print(
-            f"[{epoch:04d}/{num_epochs}] "
-            f"Train Loss: {train_loss.item():.4f} | "
-            f"Test Loss: {test_loss.item():.4f} | "
-            f"Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f} | "
-            f"Mean Time/Epoch: {mean_block_time:.3f}s")
+        print(f"[{epoch:04d}/{num_epochs}] Train Loss: {train_loss.item():.4f} | Test Loss: {test_loss.item():.4f} | Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f} | Mean Time/Epoch: {mean_block_time:.3f}s")
         start_block_time = time.time()
+    scheduler.step()
 
 plt.style.use('dark_background')
-
 fig, axs = plt.subplots(1, 2, figsize=(8, 4))
-
 axs[0].plot(train_loss_history, label='Train Loss')
 axs[0].plot(test_loss_history, label='Test Loss')
 axs[0].set_xlabel('Epoch')
@@ -218,7 +222,6 @@ axs[0].set_ylabel('Loss')
 axs[0].set_title('Training and Test Loss')
 axs[0].legend()
 axs[0].grid(True)
-
 axs[1].plot(train_acc_history, label='Train Accuracy')
 axs[1].plot(test_acc_history, label='Test Accuracy')
 axs[1].set_xlabel('Epoch')
@@ -226,11 +229,9 @@ axs[1].set_ylabel('Accuracy')
 axs[1].set_title('Training and Test Accuracy')
 axs[1].legend()
 axs[1].grid(True)
-
 fig.suptitle("ECG Classifier Results", fontsize=16)
 plt.tight_layout()
 plt.show()
-
 model.eval()
 no_samples_conf_matrix = 1000
 with torch.no_grad():
@@ -240,9 +241,7 @@ with torch.no_grad():
     outputs_full = model(test_data_sample)
     _, preds_full = torch.max(outputs_full, dim=1)
     test_label_indices = torch.argmax(test_label_sample, dim=1)
-
 cm = confusion_matrix(test_label_indices.cpu().numpy(), preds_full.cpu().numpy())
-
 plt.figure(figsize=(8, 6))
 plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
 plt.title('Confusion Matrix')
@@ -252,13 +251,9 @@ plt.xticks(tick_marks, [str(i) for i in range(num_classes)])
 plt.yticks(tick_marks, [str(i) for i in range(num_classes)])
 plt.ylabel('True label')
 plt.xlabel('Predicted label')
-
 thresh = cm.max() / 2.
 for i in range(cm.shape[0]):
     for j in range(cm.shape[1]):
-        plt.text(j, i, format(cm[i, j], 'd'),
-                 horizontalalignment="center",
-                 color="white" if cm[i, j] > thresh else "black")
-
+        plt.text(j, i, format(cm[i, j], 'd'), horizontalalignment="center", color="white" if cm[i, j] > thresh else "black")
 plt.tight_layout()
 plt.show()

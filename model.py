@@ -19,7 +19,6 @@ class InceptionModule1d(nn.Module):
             nn.Conv1d(in_channels, out_channels // 4, kernel_size=1)
         )
         self.act = nn.SiLU()
-
     def forward(self, x):
         out1 = self.branch1(x)
         out2 = self.branch2(x)
@@ -27,31 +26,39 @@ class InceptionModule1d(nn.Module):
         out4 = self.branch4(x)
         return self.act(torch.cat([out1, out2, out3, out4], dim=1))
 
-class ECGClassifier(nn.Module):
-    def __init__(self, no_labels):
+class FilterBankTransform(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding):
         super().__init__()
-        self.lift = nn.Conv1d(1, 128, kernel_size=1)
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
+    def forward(self, x):
+        return self.conv(x)
+
+class ECGClassifier(nn.Module):
+    def __init__(self, no_labels, seq_len):
+        super().__init__()
+        self.lift = nn.Conv1d(1, 64, kernel_size=1)
+        self.wavelet = FilterBankTransform(64, 64, kernel_size=5, padding=2)
         self.act = nn.SiLU()
         self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
-        self.inception1 = InceptionModule1d(128, 256)
-        self.res1 = nn.Conv1d(128, 256, kernel_size=1)
-        self.inception2 = InceptionModule1d(256, 512)
-        self.res2 = nn.Conv1d(256, 512, kernel_size=1)
-        self.inception3 = InceptionModule1d(512, 1024)
-        self.res3 = nn.Conv1d(512, 1024, kernel_size=1)
-        self.inception4 = InceptionModule1d(1024, 2048)
-        self.res4 = nn.Conv1d(1024, 2048, kernel_size=1)
+        self.inception1 = InceptionModule1d(64, 128)
+        self.res1 = nn.Conv1d(64, 128, kernel_size=1)
+        self.inception2 = InceptionModule1d(128, 256)
+        self.res2 = nn.Conv1d(128, 256, kernel_size=1)
+        self.inception3 = InceptionModule1d(256, 512)
+        self.res3 = nn.Conv1d(256, 512, kernel_size=1)
+        self.inception4 = InceptionModule1d(512, 1024)
+        self.res4 = nn.Conv1d(512, 1024, kernel_size=1)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.dropout = nn.Dropout(0.1)
-        self.fc0 = nn.Linear(2048, 1024)
-        self.fc1 = nn.Linear(1024, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.head = nn.Linear(256, no_labels)
-
+        self.fc0 = nn.Linear(1024, 512)
+        self.fc1 = nn.Linear(512, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.head = nn.Linear(128, no_labels)
     def forward(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(1)
         x = self.lift(x)
+        x = self.wavelet(x)
         x = self.act(x)
         x = self.maxpool(x)
         residual = self.res1(x)
