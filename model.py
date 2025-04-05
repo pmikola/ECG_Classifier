@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from linformer import Linformer
 
 class InceptionModule1d(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -26,18 +27,38 @@ class InceptionModule1d(nn.Module):
         out4 = self.branch4(x)
         return self.act(torch.cat([out1, out2, out3, out4], dim=1))
 
-class FilterBankTransform(nn.Module):
+class LearnableWaveletTransform(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding):
         super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.center_frequencies = nn.Parameter(torch.rand(out_channels, device=torch.device('cuda')))
+        self.scales = nn.Parameter(torch.rand(out_channels, device=torch.device('cuda')))
+        self.t = torch.linspace(-self.kernel_size//2, self.kernel_size//2, steps=5, device=torch.device('cuda'))
+
     def forward(self, x):
-        return self.conv(x)
+        eps = 1e-6
+        kernels = []
+        for i in range(self.out_channels):
+            f = self.center_frequencies[i]
+            sigma = self.scales[i].clamp(min=1e-4)
+            kernel = torch.exp(-self.t**2/(2*(sigma**2 + eps))) * torch.cos(2*torch.pi*f*self.t)
+            kernel = kernel / (kernel.sum() + eps)
+            kernels.append(kernel)
+        kernels = torch.stack(kernels, dim=0)
+        kernels = kernels.unsqueeze(1).repeat(1, self.in_channels, 1)
+        out = F.conv1d(x, kernels, padding=self.padding)
+        return out
 
 class ECGClassifier(nn.Module):
     def __init__(self, no_labels, seq_len):
         super().__init__()
         self.lift = nn.Conv1d(1, 64, kernel_size=1)
-        self.wavelet = FilterBankTransform(64, 64, kernel_size=5, padding=2)
+        self.wavelet = LearnableWaveletTransform(64, 64, kernel_size=3, padding=2)
+        self.linformer = Linformer(dim=64, seq_len=seq_len, depth=1, heads=8, k=32)
+        self.linformer_project = nn.Linear(64, 64)
         self.act = nn.SiLU()
         self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
         self.inception1 = InceptionModule1d(64, 128)
@@ -59,6 +80,10 @@ class ECGClassifier(nn.Module):
             x = x.unsqueeze(1)
         x = self.lift(x)
         x = self.wavelet(x)
+        x = x.transpose(1,2)
+        x = self.linformer(x)
+        x = self.linformer_project(x)
+        x = x.transpose(1,2)
         x = self.act(x)
         x = self.maxpool(x)
         residual = self.res1(x)
