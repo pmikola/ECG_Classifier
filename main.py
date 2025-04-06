@@ -13,6 +13,7 @@ import torch
 from torch import nn, optim
 import torch.nn.functional as F
 import torch.cuda.amp as amp
+import umap
 from model import ECGClassifier
 
 matplotlib.use('TkAgg')
@@ -79,46 +80,67 @@ sampling_rate = 100
 
 Y = pd.read_csv(path+'ptbxl_database.csv', index_col='ecg_id')
 Y.scp_codes = Y.scp_codes.apply(lambda x: ast.literal_eval(x))
-
 X = load_raw_data(Y, sampling_rate, path)
-
 agg_df = pd.read_csv(path+'scp_statements.csv', index_col=0)
 agg_df = agg_df[agg_df.diagnostic == 1]
-
 Y['diagnostic_superclass'] = Y.scp_codes.apply(aggregate_diagnostic)
-
 test_fold = 10
 X_train = X[np.where(Y.strat_fold != test_fold)]
 X_test = X[np.where(Y.strat_fold == test_fold)]
-
 y_train = np.array(Y[(Y.strat_fold != test_fold)].diagnostic_superclass)
 y_test  = np.array(Y[Y.strat_fold == test_fold].diagnostic_superclass)
-
 unique_classes = np.unique(np.concatenate(Y['diagnostic_superclass'].values))
 print(unique_classes)
 num_classes = len(unique_classes)
 class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
-
 X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
 X_test_t  = torch.tensor(X_test,  dtype=torch.float32, device=device)
-
 y_train_ohe = np.array([one_hot_encode(labels, num_classes) for labels in y_train])
 y_test_ohe  = np.array([one_hot_encode(labels, num_classes) for labels in y_test])
-
 y_train_t = torch.tensor(y_train_ohe, dtype=torch.float32, device=device)
 y_test_t  = torch.tensor(y_test_ohe,  dtype=torch.float32, device=device)
-
 train_int_labels = torch.argmax(y_train_t, dim=1)
 indices_by_class = {c: (train_int_labels == c).nonzero(as_tuple=True)[0] for c in range(num_classes)}
+
+reducer = umap.UMAP(
+    n_neighbors=10,
+    n_components=2,
+    min_dist=0.99,
+    spread=2.0,
+    set_op_mix_ratio=1.0,
+    local_connectivity=1,
+    repulsion_strength=15.0,
+    negative_sample_rate=10,
+    n_epochs=5000,
+    learning_rate=1,
+    init='spectral',
+    random_state=42,
+    metric='euclidean',
+    verbose=True
+)
+X_umap = reducer.fit_transform(X_train.reshape(X_train.shape[0], -1))
+plt.figure(figsize=(8,6), facecolor='black')
+ax = plt.gca()
+ax.set_facecolor('black')
+colors = plt.get_cmap("Set1").colors
+for c in range(num_classes):
+    idx = np.where(train_int_labels.cpu().numpy() == c)[0]
+    plt.scatter(X_umap[idx,0], X_umap[idx,1], color=colors[c % len(colors)], label=str(c), s=5)
+plt.title("UMAP Visualization of Training Data", color='white')
+plt.legend(facecolor='black', edgecolor='white', labelcolor='white')
+ax.tick_params(colors='white')
+plt.show()
+
 
 num_epochs = 10000
 batch_size = 32
 lead_view = 0
-modes = 5
 seq_len = 1000
 model = ECGClassifier(num_classes, seq_len).to(device)
 print('Model Parameters: ', count_parameters(model))
-criterion = FocalLoss(gamma=2.0, num_classes=num_classes)
+class_weights = torch.ones(num_classes, device=device)
+class_weights[2] = 2.0
+criterion = nn.CrossEntropyLoss(weight=class_weights)
 optimizer = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=5e-6, amsgrad=True)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)
 
@@ -126,7 +148,6 @@ train_loss_history = []
 test_loss_history  = []
 train_acc_history  = []
 test_acc_history   = []
-
 start_block_time = time.time()
 
 def augment_data(data):
@@ -148,13 +169,13 @@ def augment_data(data):
         noise = torch.randn_like(data, device=device) * noise_std
         data_noisy = data + noise
         num_segments = 4
-        batch_size, channels, length = data_noisy.shape
-        segment_length = length // num_segments
+        b, c, l = data_noisy.shape
+        segment_length = l // num_segments
         if segment_length > 0:
             segments = []
             for i in range(num_segments):
                 start = i * segment_length
-                end = start + segment_length if i < num_segments - 1 else length
+                end = start + segment_length if i < num_segments - 1 else l
                 segments.append(data_noisy[:, :, start:end])
             perm = torch.randperm(num_segments, device=device)
             return torch.cat([segments[i] for i in perm], dim=2)
@@ -242,18 +263,19 @@ with torch.no_grad():
     _, preds_full = torch.max(outputs_full, dim=1)
     test_label_indices = torch.argmax(test_label_sample, dim=1)
 cm = confusion_matrix(test_label_indices.cpu().numpy(), preds_full.cpu().numpy())
+cm_norm = 100 * cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-6)
 plt.figure(figsize=(8, 6))
-plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-plt.title('Confusion Matrix')
+plt.imshow(cm_norm, interpolation='nearest', cmap=plt.cm.Blues)
+plt.title('Confusion Matrix (%)')
 plt.colorbar()
 tick_marks = np.arange(num_classes)
 plt.xticks(tick_marks, [str(i) for i in range(num_classes)])
 plt.yticks(tick_marks, [str(i) for i in range(num_classes)])
 plt.ylabel('True label')
 plt.xlabel('Predicted label')
-thresh = cm.max() / 2.
-for i in range(cm.shape[0]):
-    for j in range(cm.shape[1]):
-        plt.text(j, i, format(cm[i, j], 'd'), horizontalalignment="center", color="white" if cm[i, j] > thresh else "black")
+thresh = cm_norm.max() / 2.
+for i in range(cm_norm.shape[0]):
+    for j in range(cm_norm.shape[1]):
+        plt.text(j, i, f"{cm_norm[i, j]:.1f}%", horizontalalignment="center", color="white" if cm_norm[i, j] > thresh else "black")
 plt.tight_layout()
 plt.show()

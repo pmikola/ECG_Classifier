@@ -55,10 +55,10 @@ class LearnableWaveletTransform(nn.Module):
 class ECGClassifier(nn.Module):
     def __init__(self, no_labels, seq_len):
         super().__init__()
-        self.lift = nn.Conv1d(1, 64, kernel_size=1)
-        self.wavelet = LearnableWaveletTransform(64, 64, kernel_size=3, padding=2)
-        self.linformer = Linformer(dim=64, seq_len=seq_len, depth=1, heads=8, k=32)
-        self.linformer_project = nn.Linear(64, 64)
+        self.lift = nn.Conv1d(1, 32, kernel_size=1)
+        self.wavelet = LearnableWaveletTransform(32, 32, kernel_size=3, padding=2)
+        self.linformer = Linformer(dim=32, seq_len=seq_len, depth=1, heads=16, k=16)
+        self.linformer_project = nn.Linear(32, 64)
         self.act = nn.SiLU()
         self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
         self.inception1 = InceptionModule1d(64, 128)
