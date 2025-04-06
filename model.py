@@ -37,15 +37,14 @@ class LearnableWaveletTransform(nn.Module):
         self.center_frequencies = nn.Parameter(torch.rand(out_channels, device=torch.device('cuda')))
         self.scales = nn.Parameter(torch.rand(out_channels, device=torch.device('cuda')))
         self.t = torch.linspace(-self.kernel_size//2, self.kernel_size//2, steps=5, device=torch.device('cuda'))
-
     def forward(self, x):
         eps = 1e-6
         kernels = []
         for i in range(self.out_channels):
             f = self.center_frequencies[i]
             sigma = self.scales[i].clamp(min=1e-4)
-            kernel = torch.exp(-self.t**2/(2*(sigma**2 + eps))) * torch.cos(2*torch.pi*f*self.t)
-            kernel = kernel / (kernel.sum() + eps)
+            kernel = torch.exp(-self.t**2/(2*(sigma**2+eps))) * torch.cos(2*torch.pi*f*self.t)
+            kernel = kernel/(kernel.sum()+eps)
             kernels.append(kernel)
         kernels = torch.stack(kernels, dim=0)
         kernels = kernels.unsqueeze(1).repeat(1, self.in_channels, 1)
@@ -75,8 +74,23 @@ class ECGClassifier(nn.Module):
         self.fc1 = nn.Linear(512, 256)
         self.fc2 = nn.Linear(256, 128)
         self.head = nn.Linear(128, no_labels)
+        self.aux_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.SiLU(),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.SiLU(),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.SiLU(),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.SiLU(),
+            nn.Linear(32, 2)
+        )
     def forward(self, x):
-        if x.dim() == 2:
+        if x.dim()==2:
             x = x.unsqueeze(1)
         x = self.lift(x)
         x = self.wavelet(x)
@@ -88,24 +102,25 @@ class ECGClassifier(nn.Module):
         x = self.maxpool(x)
         residual = self.res1(x)
         x = self.inception1(x)
-        x = x + residual
+        x = x+residual
         residual = self.res2(x)
         x = self.inception2(x)
-        x = x + residual
+        x = x+residual
         residual = self.res3(x)
         x = self.inception3(x)
-        x = x + residual
+        x = x+residual
         residual = self.res4(x)
         x = self.inception4(x)
-        x = x + residual
+        x = x+residual
         x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
+        x = x.view(x.size(0),-1)
         x = self.dropout(x)
-        x = self.fc0(x)
-        x = self.act(x)
+        x_c = self.fc0(x)
+        x = self.act(x_c)
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
         x = self.act(x)
-        x = self.head(x)
-        return x
+        main = self.head(x)
+        aux = self.aux_head(x_c)
+        return main, aux
