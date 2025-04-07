@@ -15,15 +15,16 @@ import torch.nn.functional as F
 import torch.cuda.amp as amp
 import umap
 from model import ECGClassifier
+
 matplotlib.use('TkAgg')
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, num_classes=None, reduction='mean'):
+    def __init__(self, gamma=2.0, class_weight=None, reduction='mean'):
         super().__init__()
         self.gamma = gamma
         self.reduction = reduction
-        if num_classes is not None:
-            self.class_weights = nn.Parameter(torch.ones(num_classes, device=torch.device('cuda')))
+        if class_weight is not None:
+            self.class_weights = nn.Parameter(class_weight)
         else:
             self.class_weights = None
     def forward(self, inputs, targets):
@@ -83,6 +84,7 @@ X = load_raw_data(Y, sampling_rate, path)
 agg_df = pd.read_csv(path+'scp_statements.csv', index_col=0)
 agg_df = agg_df[agg_df.diagnostic == 1]
 Y['diagnostic_superclass'] = Y.scp_codes.apply(aggregate_diagnostic)
+
 test_fold = 10
 X_train = X[np.where(Y.strat_fold != test_fold)]
 X_test = X[np.where(Y.strat_fold == test_fold)]
@@ -92,15 +94,18 @@ unique_classes = np.unique(np.concatenate(Y['diagnostic_superclass'].values))
 print(unique_classes)
 num_classes = len(unique_classes)
 class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
+
 X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
 X_test_t  = torch.tensor(X_test, dtype=torch.float32, device=device)
+
 y_train_ohe = np.array([one_hot_encode(labels, num_classes) for labels in y_train])
 y_test_ohe  = np.array([one_hot_encode(labels, num_classes) for labels in y_test])
 y_train_t = torch.tensor(y_train_ohe, dtype=torch.float32, device=device)
-y_test_t  = torch.tensor(y_test_ohe, dtype=torch.float32, device=device)
+y_test_t = torch.tensor(y_test_ohe, dtype=torch.float32, device=device)
+
 train_int_labels = torch.argmax(y_train_t, dim=1)
 indices_by_class = {c: (train_int_labels == c).nonzero(as_tuple=True)[0] for c in range(num_classes)}
-#
+
 # reducer = umap.UMAP(
 #     n_neighbors=10,
 #     n_components=2,
@@ -136,17 +141,18 @@ lead_view = 0
 seq_len = 1000
 model = ECGClassifier(num_classes, seq_len).to(device)
 print('Model Parameters: ', count_parameters(model))
+
 class_weights = torch.ones(num_classes, device=device)
-class_weights[2] = 2.0
-criterion_main = FocalLoss(gamma=2.0, num_classes=num_classes)
+class_weights[2] = 1.1
+criterion_main = FocalLoss(gamma=2.0, class_weight=class_weights)
 criterion_aux = nn.BCEWithLogitsLoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9,0.999), eps=1e-8, weight_decay=5e-6, amsgrad=True)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)
 
 train_loss_history = []
-test_loss_history = []
-train_acc_history = []
-test_acc_history = []
+test_loss_history  = []
+train_acc_history  = []
+test_acc_history   = []
 start_block_time = time.time()
 
 def augment_data(data):
@@ -161,14 +167,14 @@ def augment_data(data):
         shift = torch.randint(-10, 10, (1,), device=device).item()
         return data.roll(shift, dims=-1)
     elif aug == 2:
-        scale = torch.empty(1, device=device).uniform_(0.9,1.1).item()
+        scale = torch.empty(1, device=device).uniform_(0.9, 1.1).item()
         return data * scale
     elif aug == 3:
         noise_std = 0.01
         noise = torch.randn_like(data, device=device) * noise_std
         data_noisy = data + noise
-        num_segments = 4
         b, c, l = data_noisy.shape
+        num_segments = 4
         segment_length = l // num_segments
         if segment_length > 0:
             segments = []
@@ -197,48 +203,61 @@ for epoch in range(num_epochs):
     random_train_indices = torch.cat(balanced_indices)
     random_train_indices = random_train_indices[torch.randperm(random_train_indices.shape[0], device=device)]
     random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:batch_size]
+
     train_data_sample = X_train_t[random_train_indices, :, lead_view]
     train_label_sample = y_train_t[random_train_indices]
     train_data_sample = augment_data(train_data_sample)
+
     test_data_sample = X_test_t[random_test_indices, :, lead_view]
     test_label_sample = y_test_t[random_test_indices]
+
     model.train()
     main_logits, aux_logits = model(train_data_sample)
     main_targets = torch.argmax(train_label_sample, dim=1)
-    main_loss = criterion_main(main_logits, main_targets)
     binary_targets = (main_targets == 2).float().unsqueeze(1)
-    aux_loss = criterion_aux(aux_logits[:,1].unsqueeze(1), binary_targets)
+    train_combined_logits = main_logits.clone()
+    train_combined_logits[:,2] = train_combined_logits[:,2] + aux_logits.squeeze(1)
+    main_loss = criterion_main(train_combined_logits, main_targets)
+    aux_loss = criterion_aux(aux_logits, binary_targets)
     loss = main_loss + aux_loss
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    _, train_preds = torch.max(main_logits, dim=1)
+
+    train_prob = F.softmax(train_combined_logits, dim=1)
+    _, train_preds = torch.max(train_prob, dim=1)
     train_correct = (train_preds == main_targets).sum().item()
     train_acc = train_correct / main_targets.size(0)
+
     model.eval()
     with torch.no_grad():
         main_test_logits, aux_test_logits = model(test_data_sample)
-        test_loss = criterion_main(main_test_logits, torch.argmax(test_label_sample, dim=1))
-        main_prob = F.softmax(main_test_logits, dim=1)
-        aux_prob = aux_test_logits[:,1]
-        final_prob = main_prob.clone()
-        final_prob[:,2] = torch.sigmoid(main_prob[:,2] + aux_prob)
-        final_prob = final_prob / final_prob.sum(dim=1, keepdim=True)
-        _, test_preds = torch.max(final_prob, dim=1)
-    test_label_indices = torch.argmax(test_label_sample, dim=1)
-    test_correct = (test_preds == test_label_indices).sum().item()
-    test_acc = test_correct / test_label_indices.size(0)
+        test_combined_logits = main_test_logits.clone()
+        test_combined_logits[:,2] = test_combined_logits[:,2] + aux_test_logits.squeeze(1)
+        test_targets = torch.argmax(test_label_sample, dim=1)
+        test_main_loss = criterion_main(test_combined_logits, test_targets)
+        test_binary_targets = (test_targets == 2).float().unsqueeze(1)
+        test_aux_loss = criterion_aux(aux_test_logits, test_binary_targets)
+        test_loss = test_main_loss + test_aux_loss
+        test_prob = F.softmax(test_combined_logits, dim=1)
+        _, test_preds = torch.max(test_prob, dim=1)
+        test_correct = (test_preds == test_targets).sum().item()
+        test_acc = test_correct / test_targets.size(0)
+
     if epoch % 10 == 0:
         train_loss_history.append(loss.item())
         test_loss_history.append(test_loss.item())
         train_acc_history.append(train_acc)
         test_acc_history.append(test_acc)
+
     if epoch % 50 == 0 and epoch > 0:
         end_block_time = time.time()
         block_elapsed = end_block_time - start_block_time
         mean_block_time = block_elapsed / 50.0
         print(f"[{epoch:04d}/{num_epochs}] Loss: {loss.item():.4f} | Test Loss: {test_loss.item():.4f} | Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f} | Mean Time/Epoch: {mean_block_time:.3f}s")
         start_block_time = time.time()
+
     scheduler.step()
 
 plt.style.use('dark_background')
@@ -260,22 +279,22 @@ axs[1].grid(True)
 fig.suptitle("ECG Classifier Results", fontsize=16)
 plt.tight_layout()
 plt.show()
+
 model.eval()
-no_samples_conf_matrix = 1000
 with torch.no_grad():
-    random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:no_samples_conf_matrix]
+    random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:1000]
     test_data_sample = X_test_t[random_test_indices, :, lead_view]
     test_label_sample = y_test_t[random_test_indices]
     main_test_logits, aux_test_logits = model(test_data_sample)
-    main_prob = F.softmax(main_test_logits, dim=1)
-    aux_prob = aux_test_logits[:,1]
-    final_prob = main_prob.clone()
-    final_prob[:,2] = torch.sigmoid(main_prob[:,2] + aux_prob)
-    final_prob = final_prob / final_prob.sum(dim=1, keepdim=True)
+    final_combined_logits = main_test_logits.clone()
+    final_combined_logits[:,2] = final_combined_logits[:,2] + aux_test_logits.squeeze(1)
+    final_prob = F.softmax(final_combined_logits, dim=1)
     _, preds_full = torch.max(final_prob, dim=1)
     test_label_indices = torch.argmax(test_label_sample, dim=1)
+
 cm = confusion_matrix(test_label_indices.cpu().numpy(), preds_full.cpu().numpy())
 cm_norm = 100 * cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-6)
+
 plt.figure(figsize=(8,6))
 plt.imshow(cm_norm, interpolation='nearest', cmap=plt.cm.Blues)
 plt.title('Confusion Matrix (%)')
@@ -288,6 +307,7 @@ plt.xlabel('Predicted label')
 thresh = cm_norm.max() / 2.
 for i in range(cm_norm.shape[0]):
     for j in range(cm_norm.shape[1]):
-        plt.text(j, i, f"{cm_norm[i, j]:.1f}%", horizontalalignment="center", color="white" if cm_norm[i, j] > thresh else "black")
+        plt.text(j, i, f"{cm_norm[i, j]:.1f}%", horizontalalignment="center",
+                 color="white" if cm_norm[i, j] > thresh else "black")
 plt.tight_layout()
 plt.show()
