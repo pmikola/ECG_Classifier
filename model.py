@@ -80,7 +80,9 @@ class ECGClassifier(nn.Module):
         self.aux_inception = InceptionModule1d(16, 32)
         self.aux_res = nn.Conv1d(16, 32, kernel_size=1)
         self.aux_avg = nn.AdaptiveAvgPool1d(1)
-        self.aux_fc = nn.Linear(32, 1)
+        self.aux_fc0 = nn.Linear(32, 16)
+        self.aux_fc1 = nn.Linear(16, 8)
+        self.aux_head = nn.Linear(8, 2)
 
     def forward(self, x):
         if x.dim() == 2:
@@ -128,5 +130,7 @@ class ECGClassifier(nn.Module):
         x_aux = x_aux + r_aux
         x_aux = self.aux_avg(x_aux)
         x_aux = x_aux.view(x_aux.size(0), -1)
-        aux_out = self.aux_fc(x_aux)
+        x_aux = self.act(self.aux_fc0(x_aux))
+        x_aux = self.act(self.aux_fc1(x_aux))
+        aux_out = self.aux_head(x_aux)
         return main_out, aux_out

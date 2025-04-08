@@ -14,6 +14,7 @@ from torch import nn, optim
 import torch.nn.functional as F
 import torch.cuda.amp as amp
 import umap
+import pickle
 from model import ECGClassifier
 
 matplotlib.use('TkAgg')
@@ -48,6 +49,11 @@ class FocalLoss(nn.Module):
             return loss.sum()
         return loss
 
+def one_hot_cross_entropy_loss(logits, target_one_hot):
+    log_probs = F.log_softmax(logits, dim=1)
+    loss = - torch.sum(target_one_hot * log_probs, dim=1)
+    return loss.mean()
+
 def load_raw_data(df, sampling_rate, path):
     if sampling_rate == 100:
         data = [wfdb.rdsamp(path + f) for f in df.filename_lr]
@@ -75,96 +81,170 @@ def count_parameters(model):
 device = torch.device('cuda')
 print("Using device:", device)
 
-path = 'ptb-xl-dataset/'
-sampling_rate = 100
+# --- Dataset preparation ---
+dataset_path = "dataset.pkl"
+if os.path.exists(dataset_path):
+    with open(dataset_path, "rb") as f:
+        dataset = pickle.load(f)
+    X_train_t = dataset["X_train_t"]
+    X_test_t = dataset["X_test_t"]
+    y_train_t = dataset["y_train_t"]
+    y_test_t = dataset["y_test_t"]
+    train_int_labels = dataset["train_int_labels"]
+    indices_by_class = dataset["indices_by_class"]
+    num_classes = dataset["num_classes"]
+    class_to_idx = dataset["class_to_idx"]
+    print("Loaded dataset from pickle.")
+else:
+    path = 'ptb-xl-dataset/'
+    sampling_rate = 100
+    Y = pd.read_csv(path + 'ptbxl_database.csv', index_col='ecg_id')
+    Y.scp_codes = Y.scp_codes.apply(lambda x: ast.literal_eval(x))
+    X = load_raw_data(Y, sampling_rate, path)
+    agg_df = pd.read_csv(path + 'scp_statements.csv', index_col=0)
+    agg_df = agg_df[agg_df.diagnostic == 1]
+    Y['diagnostic_superclass'] = Y.scp_codes.apply(aggregate_diagnostic)
+    test_fold = 10
+    X_train = X[np.where(Y.strat_fold != test_fold)]
+    X_test  = X[np.where(Y.strat_fold == test_fold)]
+    y_train = np.array(Y[(Y.strat_fold != test_fold)].diagnostic_superclass)
+    y_test  = np.array(Y[Y.strat_fold == test_fold].diagnostic_superclass)
+    unique_classes = np.unique(np.concatenate(Y['diagnostic_superclass'].values))
+    print(unique_classes)
+    num_classes = len(unique_classes)
+    class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
+    X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
+    def one_hot_encode_local(labels, num_classes):
+        v = np.zeros(num_classes, dtype=np.float32)
+        for lbl in labels:
+            v[class_to_idx[lbl]] = 1.0
+        return v
+    y_train_ohe = np.array([one_hot_encode_local(lbls, num_classes) for lbls in y_train])
+    y_test_ohe  = np.array([one_hot_encode_local(lbls, num_classes) for lbls in y_test])
+    y_train_t = torch.tensor(y_train_ohe, dtype=torch.float32, device=device)
+    y_test_t = torch.tensor(y_test_ohe, dtype=torch.float32, device=device)
+    train_int_labels = torch.argmax(y_train_t, dim=1)
+    indices_by_class = {c: (train_int_labels == c).nonzero(as_tuple=True)[0] for c in range(num_classes)}
+    dataset = {"X_train_t": X_train_t, "X_test_t": X_test_t,
+               "y_train_t": y_train_t, "y_test_t": y_test_t,
+               "train_int_labels": train_int_labels,
+               "indices_by_class": indices_by_class,
+               "num_classes": num_classes,
+               "class_to_idx": class_to_idx}
+    with open(dataset_path, "wb") as f:
+        pickle.dump(dataset, f)
+    print("Processed dataset and saved to pickle.")
 
-Y = pd.read_csv(path + 'ptbxl_database.csv', index_col='ecg_id')
-Y.scp_codes = Y.scp_codes.apply(lambda x: ast.literal_eval(x))
-X = load_raw_data(Y, sampling_rate, path)
-agg_df = pd.read_csv(path + 'scp_statements.csv', index_col=0)
-agg_df = agg_df[agg_df.diagnostic == 1]
-Y['diagnostic_superclass'] = Y.scp_codes.apply(aggregate_diagnostic)
+# --- UMAP embedding and distance matrix computation ---
+umap_path = "umap_results.pkl"
+if os.path.exists(umap_path):
+    with open(umap_path, "rb") as f:
+        umap_dict = pickle.load(f)
+    centroids = umap_dict["centroids"]
+    D_matrix = umap_dict["D_matrix"]
+    print("Loaded UMAP results from pickle.")
+else:
+    # Use whole dataset: concatenate train and test
+    X_all = torch.cat([X_train_t, X_test_t], dim=0)
+    # Use only the lead_view (same as used for training)
+    X_all_flat = X_all[:, :, 0].cpu().numpy()  # shape [N, seq_len]
+    reducer = umap.UMAP(n_neighbors=10, n_components=2, min_dist=0.99,
+                        spread=2.0, set_op_mix_ratio=1.0, local_connectivity=1,
+                        repulsion_strength=15.0, negative_sample_rate=10,
+                        n_epochs=20, learning_rate=1, init='spectral',
+                        random_state=42, metric='euclidean', verbose=True)
+    embedding = reducer.fit_transform(X_all_flat)
+    y_train_int = torch.argmax(y_train_t, dim=1).cpu().numpy()
+    y_test_int = torch.argmax(y_test_t, dim=1).cpu().numpy()
+    y_all = np.concatenate([y_train_int, y_test_int], axis=0)
+    centroids = {}
+    umap_class_cloud_idx = {}
+    umap_class_cloud_emb = {}
 
-test_fold = 10
-X_train = X[np.where(Y.strat_fold != test_fold)]
-X_test  = X[np.where(Y.strat_fold == test_fold)]
-y_train = np.array(Y[(Y.strat_fold != test_fold)].diagnostic_superclass)
-y_test  = np.array(Y[Y.strat_fold == test_fold].diagnostic_superclass)
+    for c in range(num_classes):
+        idx = np.where(y_all == c)[0]
+        umap_class_cloud_idx[str(c)] = idx
+        umap_class_cloud_emb[str(c)] = embedding[idx, :]
 
-unique_classes = np.unique(np.concatenate(Y['diagnostic_superclass'].values))
-print(unique_classes)
-num_classes   = len(unique_classes)
-class_to_idx  = {cls: idx for idx, cls in enumerate(unique_classes)}
+    distance_matrix = np.zeros((X_all_flat.shape[0],num_classes,3))
+    for i in range(X_all_flat.shape[0]):
+        for c in range(num_classes):
+            idx= umap_class_cloud_idx[str(c)]
+            if idx[i] == i:
+                pos_val = umap_class_cloud_emb[str(c)][i]
+                distance_matrix[i, c, 0:2] = pos_val
+                distance_matrix[i, c, 2] = 1.
+            else:
+                pass
+        idx = distance_matrix[i, :, 2] == 1.
+        idx_other = [k for k, x in enumerate(idx) if not x]
+        idx_center = [k for k, x in enumerate(idx) if x]
+        other_vals_x = [(np.abs(umap_class_cloud_emb[str(k)][:,0]-distance_matrix[i, idx_center, 0])).argmin() for k in idx_other]
+        other_vals_y = [(np.abs(umap_class_cloud_emb[str(k)][:,1]-distance_matrix[i, idx_center, 1])).argmin() for k in idx_other]
+        l = 0
+        for indx in idx_other:
+            print(indx)
+            distance_matrix[i, indx ,0] = umap_class_cloud_emb[str(indx)][other_vals_x[l],0]
+            distance_matrix[i, indx ,1] = umap_class_cloud_emb[str(indx)][other_vals_y[l],1]
+            #print()
+            l+=1
+    print(distance_matrix)
 
-X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
-X_test_t  = torch.tensor(X_test,  dtype=torch.float32, device=device)
+    sys.exit()
+    D_matrix = np.zeros((num_classes, num_classes), dtype=np.float32)
+    for i in range(num_classes):
+        for j in range(num_classes):
+            D_matrix[i, j] = np.linalg.norm(centroids[i] - centroids[j])
+    umap_dict = {"centroids": centroids, "D_matrix": D_matrix, "embedding": embedding}
+    with open(umap_path, "wb") as f:
+        pickle.dump(umap_dict, f)
+    print("Computed UMAP results and saved to pickle.")
 
-def one_hot_encode(labels, num_classes):
-    v = np.zeros(num_classes, dtype=np.float32)
-    for lbl in labels:
-        v[class_to_idx[lbl]] = 1.0
-    return v
+sys.exit()
+lambda_umap = 0.1
 
-y_train_ohe = np.array([one_hot_encode(lbls, num_classes) for lbls in y_train])
-y_test_ohe  = np.array([one_hot_encode(lbls, num_classes) for lbls in y_test])
-y_train_t   = torch.tensor(y_train_ohe, dtype=torch.float32, device=device)
-y_test_t    = torch.tensor(y_test_ohe,  dtype=torch.float32, device=device)
-
-train_int_labels = torch.argmax(y_train_t, dim=1)
-indices_by_class = {c: (train_int_labels == c).nonzero(as_tuple=True)[0]
-                    for c in range(num_classes)}
-
-num_epochs  = 10000
-batch_size  = 32
-lead_view   = 0
-seq_len     = 1000
-model       = ECGClassifier(num_classes, seq_len).to(device)
+# --- Training and evaluation ---
+num_epochs = 10000
+batch_size = 32
+lead_view = 0
+seq_len = 1000
+model = ECGClassifier(num_classes, seq_len).to(device)
 print('Model Parameters: ', count_parameters(model))
 
-class_weights    = torch.ones(num_classes, device=device)
+class_weights = torch.ones(num_classes, device=device)
 class_weights[2] = 1.1
-criterion_main   = FocalLoss(gamma=2.0, class_weight=class_weights)
-criterion_aux    = nn.BCEWithLogitsLoss()
-optimizer        = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9,0.999),
-                              eps=1e-8, weight_decay=5e-6, amsgrad=True)
-scheduler        = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)
+
+criterion_main = FocalLoss(gamma=2.0, class_weight=class_weights)
+criterion_aux = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9,0.999),
+                       eps=1e-8, weight_decay=5e-6, amsgrad=True)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)
 
 train_loss_history = []
-test_loss_history  = []
-train_acc_history  = []
-test_acc_history   = []
+test_loss_history = []
+train_acc_history = []
+test_acc_history = []
 
-start_block_time   = time.time()
+start_block_time = time.time()
 
-# UMAP CODE (commented)
-# reducer = umap.UMAP(
-#     n_neighbors=10,
-#     n_components=2,
-#     min_dist=0.99,
-#     spread=2.0,
-#     set_op_mix_ratio=1.0,
-#     local_connectivity=1,
-#     repulsion_strength=15.0,
-#     negative_sample_rate=10,
-#     n_epochs=5000,
-#     learning_rate=1,
-#     init='spectral',
-#     random_state=42,
-#     metric='euclidean',
-#     verbose=True
-# )
-# X_umap = reducer.fit_transform(X_train.reshape(X_train.shape[0], -1))
-# plt.figure(figsize=(8,6), facecolor='black')
-# ax = plt.gca()
-# ax.set_facecolor('black')
-# colors = plt.get_cmap("Set1").colors
-# for c in range(num_classes):
-#     idx = np.where(train_int_labels.cpu().numpy() == c)[0]
-#     plt.scatter(X_umap[idx,0], X_umap[idx,1], color=colors[c % len(colors)], label=str(c), s=5)
-# plt.title("UMAP Visualization of Training Data", color='white')
-# plt.legend(facecolor='black', edgecolor='white', labelcolor='white')
-# ax.tick_params(colors='white')
-# plt.show()
+def ecg_umap_plot(X_train):
+    reducer = umap.UMAP(n_neighbors=10, n_components=2, min_dist=0.99, spread=2.0,
+                        set_op_mix_ratio=1.0, local_connectivity=1, repulsion_strength=15.0,
+                        negative_sample_rate=10, n_epochs=5000, learning_rate=1,
+                        init='spectral', random_state=42, metric='euclidean', verbose=True)
+    X_umap = reducer.fit_transform(X_train.reshape(X_train.shape[0], -1))
+    plt.figure(figsize=(8,6), facecolor='black')
+    ax = plt.gca()
+    ax.set_facecolor('black')
+    colors = plt.get_cmap("Set1").colors
+    for c in range(num_classes):
+        idx = np.where(train_int_labels.cpu().numpy() == c)[0]
+        plt.scatter(X_umap[idx,0], X_umap[idx,1], color=colors[c % len(colors)], label=str(c), s=5)
+    plt.title("UMAP Visualization of Training Data", color='white')
+    plt.legend(facecolor='black', edgecolor='white', labelcolor='white')
+    ax.tick_params(colors='white')
+    plt.show()
 
 def augment_data(data):
     if data.ndim == 2:
@@ -191,26 +271,28 @@ def augment_data(data):
             segments = []
             for i in range(num_segments):
                 start = i * seg_len
-                end   = start + seg_len if i < num_segments - 1 else l
+                end = start + seg_len if i < num_segments - 1 else l
                 segments.append(data_noisy[:, :, start:end])
             perm = torch.randperm(num_segments, device=data_noisy.device)
             return torch.cat([segments[i] for i in perm], dim=2)
         else:
             return data_noisy
 
-def fuse_logits_dynamic(main_logits, aux_logits):
+def fuse_logits_dynamic(main_logits, aux_positive):
     with torch.no_grad():
         main_probs = F.softmax(main_logits, dim=1)
         main_conf, _ = main_probs.max(dim=1)
-        aux_prob = torch.sigmoid(aux_logits.squeeze(1))
-        aux_conf = torch.abs(aux_prob - 0.5)*2
+        aux_conf = torch.abs(aux_positive - 0.5) * 2
         conf_sum = main_conf + aux_conf + 1e-8
         w_main = (main_conf / conf_sum).unsqueeze(1)
-        w_aux  = (aux_conf  / conf_sum).unsqueeze(1)
-    fused = main_logits + 0.0
-    combined_2 = w_main * fused[:, 2:3] + w_aux * aux_logits
+        w_aux = (aux_conf / conf_sum).unsqueeze(1)
+    fused = main_logits.clone()
+    combined_2 = w_main * fused[:, 2:3] + w_aux * aux_positive.unsqueeze(1)
     fused_logits = torch.cat([fused[:, :2], combined_2, fused[:, 3:]], dim=1)
     return fused_logits
+
+D_tensor = torch.tensor(D_matrix, device=device, dtype=torch.float32)
+
 
 for epoch in range(num_epochs):
     samples_per_class = batch_size // num_classes
@@ -225,67 +307,61 @@ for epoch in range(num_epochs):
         idx = indices_by_class[c]
         chosen = idx[torch.randint(0, idx.shape[0], (1,), device=device)]
         balanced_indices.append(chosen)
-
     random_train_indices = torch.cat(balanced_indices)
     random_train_indices = random_train_indices[torch.randperm(random_train_indices.shape[0], device=device)]
-    random_test_indices  = torch.randperm(X_test_t.shape[0], device=device)[:batch_size]
-
-    train_data_sample    = X_train_t[random_train_indices, :, lead_view]
-    train_label_sample   = y_train_t[random_train_indices]
-    train_data_sample    = augment_data(train_data_sample)
-
-    test_data_sample     = X_test_t[random_test_indices, :, lead_view]
-    test_label_sample    = y_test_t[random_test_indices]
-
+    random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:batch_size]
+    train_data_sample = X_train_t[random_train_indices, :, lead_view]
+    train_label_sample = y_train_t[random_train_indices]
+    train_data_sample = augment_data(train_data_sample)
+    test_data_sample = X_test_t[random_test_indices, :, lead_view]
+    test_label_sample = y_test_t[random_test_indices]
     model.train()
     main_logits, aux_logits = model(train_data_sample)
     main_targets = torch.argmax(train_label_sample, dim=1)
-    bin_targets  = (main_targets == 2).float().unsqueeze(1)
-
-    fused_train_logits = fuse_logits_dynamic(main_logits, aux_logits)
+    aux_targets = torch.nn.functional.one_hot((main_targets == 2).long(), num_classes=2).float()
+    fused_train_logits = fuse_logits_dynamic(main_logits, aux_logits[:,1])
     main_loss = criterion_main(fused_train_logits, main_targets)
-    aux_loss  = criterion_aux(aux_logits, bin_targets)
-    loss      = main_loss + aux_loss
-
+    aux_loss = criterion_aux(aux_logits, torch.argmax(aux_targets, dim=1))
+    # UMAP extra loss: from fused logits, get predictions
+    preds_train = torch.argmax(fused_train_logits, dim=1)
+    # For each sample, if prediction is wrong, add extra penalty = D_tensor[true, pred]
+    umap_loss = torch.mean(torch.where(preds_train != main_targets,D_tensor[main_targets, preds_train],torch.zeros_like(preds_train, dtype=torch.float32)))
+    total_loss = main_loss + aux_loss + umap_loss
     optimizer.zero_grad()
-    loss.backward()
+    total_loss.backward()
     optimizer.step()
-
-    train_prob    = fused_train_logits.softmax(dim=1)
-    _, train_preds= torch.max(train_prob, dim=1)
+    train_prob = fused_train_logits.softmax(dim=1)
+    _, train_preds = torch.max(train_prob, dim=1)
     train_correct = (train_preds == main_targets).sum().item()
-    train_acc     = train_correct / main_targets.size(0)
-
+    train_acc = train_correct / main_targets.size(0)
     model.eval()
     with torch.no_grad():
         main_test_logits, aux_test_logits = model(test_data_sample)
-        test_targets    = torch.argmax(test_label_sample, dim=1)
-        fused_test_logits = fuse_logits_dynamic(main_test_logits, aux_test_logits)
-        test_main_loss    = criterion_main(fused_test_logits, test_targets)
-        bin_test_targets  = (test_targets == 2).float().unsqueeze(1)
-        test_aux_loss     = criterion_aux(aux_test_logits, bin_test_targets)
-        test_loss         = test_main_loss + test_aux_loss
-        test_prob         = fused_test_logits.softmax(dim=1)
-        _, test_preds     = torch.max(test_prob, dim=1)
-        test_correct      = (test_preds == test_targets).sum().item()
-        test_acc          = test_correct / test_targets.size(0)
-
+        test_targets = torch.argmax(test_label_sample, dim=1)
+        aux_test_targets = torch.nn.functional.one_hot((test_targets == 2).long(), num_classes=2).float()
+        fused_test_logits = fuse_logits_dynamic(main_test_logits, aux_test_logits[:,1])
+        test_main_loss = criterion_main(fused_test_logits, test_targets)
+        test_aux_loss = criterion_aux(aux_test_logits, torch.argmax(aux_test_targets, dim=1))
+        preds_test = torch.argmax(fused_test_logits, dim=1)
+        umap_test_loss = torch.mean(torch.where(preds_test != test_targets,
+                                D_tensor[test_targets, preds_test],
+                                torch.zeros_like(preds_test, dtype=torch.float32)))
+        test_loss = test_main_loss + test_aux_loss + 0.1 * umap_test_loss
+        test_prob = fused_test_logits.softmax(dim=1)
+        _, test_preds = torch.max(test_prob, dim=1)
+        test_correct = (test_preds == test_targets).sum().item()
+        test_acc = test_correct / test_targets.size(0)
     if epoch % 10 == 0:
-        train_loss_history.append(loss.item())
+        train_loss_history.append(total_loss.item())
         test_loss_history.append(test_loss.item())
         train_acc_history.append(train_acc)
         test_acc_history.append(test_acc)
-
     if epoch % 50 == 0 and epoch > 0:
         end_block_time = time.time()
-        block_elapsed  = end_block_time - start_block_time
-        mean_block_time= block_elapsed / 50.0
-        print(f"[{epoch:04d}/{num_epochs}] "
-              f"Loss: {loss.item():.4f} | Test Loss: {test_loss.item():.4f} | "
-              f"Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f} | "
-              f"Mean Time/Epoch: {mean_block_time:.3f}s")
-        start_block_time= time.time()
-
+        block_elapsed = end_block_time - start_block_time
+        mean_block_time = block_elapsed / 50.0
+        print(f"[{epoch:04d}/{num_epochs}] Total Loss: {total_loss.item():.4f} | Test Loss: {test_loss.item():.4f} | Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f} | Mean Time/Epoch: {mean_block_time:.3f}s")
+        start_block_time = time.time()
     scheduler.step()
 
 plt.style.use('dark_background')
@@ -297,7 +373,6 @@ axs[0].set_ylabel('Loss')
 axs[0].set_title('Training and Test Loss')
 axs[0].legend()
 axs[0].grid(True)
-
 axs[1].plot(train_acc_history, label='Train Accuracy')
 axs[1].plot(test_acc_history, label='Test Accuracy')
 axs[1].set_xlabel('Epoch')
@@ -305,7 +380,6 @@ axs[1].set_ylabel('Accuracy')
 axs[1].set_title('Training and Test Accuracy')
 axs[1].legend()
 axs[1].grid(True)
-
 fig.suptitle("ECG Classifier Results", fontsize=16)
 plt.tight_layout()
 plt.show()
@@ -313,17 +387,15 @@ plt.show()
 model.eval()
 with torch.no_grad():
     random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:1000]
-    test_data_sample    = X_test_t[random_test_indices, :, lead_view]
-    test_label_sample   = y_test_t[random_test_indices]
+    test_data_sample = X_test_t[random_test_indices, :, lead_view]
+    test_label_sample = y_test_t[random_test_indices]
     main_test_logits, aux_test_logits = model(test_data_sample)
-    final_fused_logits  = fuse_logits_dynamic(main_test_logits, aux_test_logits)
-    final_prob          = final_fused_logits.softmax(dim=1)
-    _, preds_full       = torch.max(final_prob, dim=1)
-    test_label_indices  = torch.argmax(test_label_sample, dim=1)
-
+    fused_final_logits = fuse_logits_dynamic(main_test_logits, aux_test_logits[:,1])
+    final_prob = fused_final_logits.softmax(dim=1)
+    _, preds_full = torch.max(final_prob, dim=1)
+    test_label_indices = torch.argmax(test_label_sample, dim=1)
 cm = confusion_matrix(test_label_indices.cpu().numpy(), preds_full.cpu().numpy())
 cm_norm = 100 * cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-6)
-
 plt.figure(figsize=(8, 6))
 plt.imshow(cm_norm, interpolation='nearest', cmap=plt.cm.Blues)
 plt.title('Confusion Matrix (%)')
@@ -333,12 +405,10 @@ plt.xticks(tick_marks, [str(i) for i in range(num_classes)])
 plt.yticks(tick_marks, [str(i) for i in range(num_classes)])
 plt.ylabel('True label')
 plt.xlabel('Predicted label')
-
 thresh = cm_norm.max() / 2.
 for i in range(cm.shape[0]):
     for j in range(cm.shape[1]):
         plt.text(j, i, f"{cm_norm[i, j]:.1f}%", horizontalalignment="center",
-                 color="white" if cm_norm[i, j] > thresh else "black")
-
+                  color="white" if cm_norm[i, j] > thresh else "black")
 plt.tight_layout()
 plt.show()
