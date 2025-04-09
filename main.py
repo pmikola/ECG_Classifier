@@ -78,155 +78,6 @@ def one_hot_encode(labels, num_classes):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-device = torch.device('cuda')
-print("Using device:", device)
-
-# --- Dataset preparation ---
-dataset_path = "dataset.pkl"
-if os.path.exists(dataset_path):
-    with open(dataset_path, "rb") as f:
-        dataset = pickle.load(f)
-    X_train_t = dataset["X_train_t"]
-    X_test_t = dataset["X_test_t"]
-    y_train_t = dataset["y_train_t"]
-    y_test_t = dataset["y_test_t"]
-    train_int_labels = dataset["train_int_labels"]
-    indices_by_class = dataset["indices_by_class"]
-    num_classes = dataset["num_classes"]
-    class_to_idx = dataset["class_to_idx"]
-    print("Loaded dataset from pickle.")
-else:
-    path = 'ptb-xl-dataset/'
-    sampling_rate = 100
-    Y = pd.read_csv(path + 'ptbxl_database.csv', index_col='ecg_id')
-    Y.scp_codes = Y.scp_codes.apply(lambda x: ast.literal_eval(x))
-    X = load_raw_data(Y, sampling_rate, path)
-    agg_df = pd.read_csv(path + 'scp_statements.csv', index_col=0)
-    agg_df = agg_df[agg_df.diagnostic == 1]
-    Y['diagnostic_superclass'] = Y.scp_codes.apply(aggregate_diagnostic)
-    test_fold = 10
-    X_train = X[np.where(Y.strat_fold != test_fold)]
-    X_test  = X[np.where(Y.strat_fold == test_fold)]
-    y_train = np.array(Y[(Y.strat_fold != test_fold)].diagnostic_superclass)
-    y_test  = np.array(Y[Y.strat_fold == test_fold].diagnostic_superclass)
-    unique_classes = np.unique(np.concatenate(Y['diagnostic_superclass'].values))
-    print(unique_classes)
-    num_classes = len(unique_classes)
-    class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
-    X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
-    X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
-    def one_hot_encode_local(labels, num_classes):
-        v = np.zeros(num_classes, dtype=np.float32)
-        for lbl in labels:
-            v[class_to_idx[lbl]] = 1.0
-        return v
-    y_train_ohe = np.array([one_hot_encode_local(lbls, num_classes) for lbls in y_train])
-    y_test_ohe  = np.array([one_hot_encode_local(lbls, num_classes) for lbls in y_test])
-    y_train_t = torch.tensor(y_train_ohe, dtype=torch.float32, device=device)
-    y_test_t = torch.tensor(y_test_ohe, dtype=torch.float32, device=device)
-    train_int_labels = torch.argmax(y_train_t, dim=1)
-    indices_by_class = {c: (train_int_labels == c).nonzero(as_tuple=True)[0] for c in range(num_classes)}
-    dataset = {"X_train_t": X_train_t, "X_test_t": X_test_t,
-               "y_train_t": y_train_t, "y_test_t": y_test_t,
-               "train_int_labels": train_int_labels,
-               "indices_by_class": indices_by_class,
-               "num_classes": num_classes,
-               "class_to_idx": class_to_idx}
-    with open(dataset_path, "wb") as f:
-        pickle.dump(dataset, f)
-    print("Processed dataset and saved to pickle.")
-
-# --- UMAP embedding and distance matrix computation ---
-umap_path = "umap_results.pkl"
-if os.path.exists(umap_path):
-    with open(umap_path, "rb") as f:
-        umap_dict = pickle.load(f)
-    centroids = umap_dict["centroids"]
-    D_matrix = umap_dict["D_matrix"]
-    print("Loaded UMAP results from pickle.")
-else:
-    # Use whole dataset: concatenate train and test
-    X_all = torch.cat([X_train_t, X_test_t], dim=0)
-    # Use only the lead_view (same as used for training)
-    X_all_flat = X_all[:, :, 0].cpu().numpy()  # shape [N, seq_len]
-    reducer = umap.UMAP(n_neighbors=10, n_components=2, min_dist=0.99,
-                        spread=2.0, set_op_mix_ratio=1.0, local_connectivity=1,
-                        repulsion_strength=15.0, negative_sample_rate=10,
-                        n_epochs=20, learning_rate=1, init='spectral',
-                        random_state=42, metric='euclidean', verbose=True)
-    embedding = reducer.fit_transform(X_all_flat)
-    y_train_int = torch.argmax(y_train_t, dim=1).cpu().numpy()
-    y_test_int = torch.argmax(y_test_t, dim=1).cpu().numpy()
-    y_all = np.concatenate([y_train_int, y_test_int], axis=0)
-    centroids = {}
-    umap_class_cloud_idx = {}
-    umap_class_cloud_emb = {}
-
-    for c in range(num_classes):
-        idx = np.where(y_all == c)[0]
-        umap_class_cloud_idx[str(c)] = idx
-        umap_class_cloud_emb[str(c)] = embedding[idx, :]
-
-    distance_matrix = np.zeros((X_all_flat.shape[0],num_classes,3))
-    for i in range(X_all_flat.shape[0]):
-        for c in range(num_classes):
-            idx= umap_class_cloud_idx[str(c)]
-            if idx[i] == i:
-                pos_val = umap_class_cloud_emb[str(c)][i]
-                distance_matrix[i, c, 0:2] = pos_val
-                distance_matrix[i, c, 2] = 1.
-            else:
-                pass
-        idx = distance_matrix[i, :, 2] == 1.
-        idx_other = [k for k, x in enumerate(idx) if not x]
-        idx_center = [k for k, x in enumerate(idx) if x]
-        other_vals_x = [(np.abs(umap_class_cloud_emb[str(k)][:,0]-distance_matrix[i, idx_center, 0])).argmin() for k in idx_other]
-        other_vals_y = [(np.abs(umap_class_cloud_emb[str(k)][:,1]-distance_matrix[i, idx_center, 1])).argmin() for k in idx_other]
-        l = 0
-        for indx in idx_other:
-            print(indx)
-            distance_matrix[i, indx ,0] = umap_class_cloud_emb[str(indx)][other_vals_x[l],0]
-            distance_matrix[i, indx ,1] = umap_class_cloud_emb[str(indx)][other_vals_y[l],1]
-            #print()
-            l+=1
-    print(distance_matrix)
-
-    sys.exit()
-    D_matrix = np.zeros((num_classes, num_classes), dtype=np.float32)
-    for i in range(num_classes):
-        for j in range(num_classes):
-            D_matrix[i, j] = np.linalg.norm(centroids[i] - centroids[j])
-    umap_dict = {"centroids": centroids, "D_matrix": D_matrix, "embedding": embedding}
-    with open(umap_path, "wb") as f:
-        pickle.dump(umap_dict, f)
-    print("Computed UMAP results and saved to pickle.")
-
-sys.exit()
-lambda_umap = 0.1
-
-# --- Training and evaluation ---
-num_epochs = 10000
-batch_size = 32
-lead_view = 0
-seq_len = 1000
-model = ECGClassifier(num_classes, seq_len).to(device)
-print('Model Parameters: ', count_parameters(model))
-
-class_weights = torch.ones(num_classes, device=device)
-class_weights[2] = 1.1
-
-criterion_main = FocalLoss(gamma=2.0, class_weight=class_weights)
-criterion_aux = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9,0.999),
-                       eps=1e-8, weight_decay=5e-6, amsgrad=True)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)
-
-train_loss_history = []
-test_loss_history = []
-train_acc_history = []
-test_acc_history = []
-
-start_block_time = time.time()
 
 def ecg_umap_plot(X_train):
     reducer = umap.UMAP(n_neighbors=10, n_components=2, min_dist=0.99, spread=2.0,
@@ -291,9 +142,171 @@ def fuse_logits_dynamic(main_logits, aux_positive):
     fused_logits = torch.cat([fused[:, :2], combined_2, fused[:, 3:]], dim=1)
     return fused_logits
 
-D_tensor = torch.tensor(D_matrix, device=device, dtype=torch.float32)
+device = torch.device('cuda')
+print("Using device:", device)
+
+# --- Dataset preparation ---
+dataset_path = "dataset.pkl"
+if os.path.exists(dataset_path):
+    with open(dataset_path, "rb") as f:
+        dataset = pickle.load(f)
+    X_train_t = dataset["X_train_t"]
+    X_test_t = dataset["X_test_t"]
+    y_train_t = dataset["y_train_t"]
+    y_test_t = dataset["y_test_t"]
+    train_int_labels = dataset["train_int_labels"]
+    indices_by_class = dataset["indices_by_class"]
+    num_classes = dataset["num_classes"]
+    class_to_idx = dataset["class_to_idx"]
+    print("Loaded dataset from pickle.")
+else:
+    path = 'ptb-xl-dataset/'
+    sampling_rate = 100
+    Y = pd.read_csv(path + 'ptbxl_database.csv', index_col='ecg_id')
+    Y.scp_codes = Y.scp_codes.apply(lambda x: ast.literal_eval(x))
+    X = load_raw_data(Y, sampling_rate, path)
+    agg_df = pd.read_csv(path + 'scp_statements.csv', index_col=0)
+    agg_df = agg_df[agg_df.diagnostic == 1]
+    Y['diagnostic_superclass'] = Y.scp_codes.apply(aggregate_diagnostic)
+    test_fold = 10
+    X_train = X[np.where(Y.strat_fold != test_fold)]
+    X_test  = X[np.where(Y.strat_fold == test_fold)]
+    y_train = np.array(Y[(Y.strat_fold != test_fold)].diagnostic_superclass)
+    y_test  = np.array(Y[Y.strat_fold == test_fold].diagnostic_superclass)
+    unique_classes = np.unique(np.concatenate(Y['diagnostic_superclass'].values))
+    print(unique_classes)
+    num_classes = len(unique_classes)
+    class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
+    X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
+    def one_hot_encode_local(labels, num_classes):
+        v = np.zeros(num_classes, dtype=np.float32)
+        for lbl in labels:
+            v[class_to_idx[lbl]] = 1.0
+        return v
+    y_train_ohe = np.array([one_hot_encode_local(lbls, num_classes) for lbls in y_train])
+    y_test_ohe  = np.array([one_hot_encode_local(lbls, num_classes) for lbls in y_test])
+    y_train_t = torch.tensor(y_train_ohe, dtype=torch.float32, device=device)
+    y_test_t = torch.tensor(y_test_ohe, dtype=torch.float32, device=device)
+    train_int_labels = torch.argmax(y_train_t, dim=1)
+    indices_by_class = {c: (train_int_labels == c).nonzero(as_tuple=True)[0] for c in range(num_classes)}
+    dataset = {"X_train_t": X_train_t, "X_test_t": X_test_t,
+               "y_train_t": y_train_t, "y_test_t": y_test_t,
+               "train_int_labels": train_int_labels,
+               "indices_by_class": indices_by_class,
+               "num_classes": num_classes,
+               "class_to_idx": class_to_idx}
+    with open(dataset_path, "wb") as f:
+        pickle.dump(dataset, f)
+    print("Processed dataset and saved to pickle.")
+
+# --- UMAP embedding and distance matrix computation ---
+umap_path = "umap_results.pkl"
+if os.path.exists(umap_path):
+    with open(umap_path, "rb") as f:
+        distance_matrix = pickle.load(f)
+    print("Loaded UMAP results from pickle.")
+else:
+    X_all = torch.cat([X_train_t, X_test_t], dim=0)
+    X_all_flat = X_all[:, :, 0].cpu().numpy()
+    reducer = umap.UMAP(n_neighbors=10, n_components=2, min_dist=0.99,
+                        spread=2.0, set_op_mix_ratio=1.0, local_connectivity=1,
+                        repulsion_strength=15.0, negative_sample_rate=10,
+                        n_epochs=10000, learning_rate=1, init='spectral',
+                        random_state=42, metric='euclidean', verbose=True)
+    embedding = reducer.fit_transform(X_all_flat)
+    y_train_int = torch.argmax(y_train_t, dim=1).cpu().numpy()
+    y_test_int = torch.argmax(y_test_t, dim=1).cpu().numpy()
+    y_all = np.concatenate([y_train_int, y_test_int], axis=0)
+    centroids = {}
+    umap_class_cloud_idx = {}
+    umap_class_cloud_emb = {}
+
+    for c in range(num_classes):
+        idx = np.where(y_all == c)[0]
+        umap_class_cloud_idx[str(c)] = idx
+        umap_class_cloud_emb[str(c)] = embedding[idx, :]
+    break_label = False
+    emb = umap_class_cloud_emb.copy()
+    distance_matrix = np.zeros((X_all_flat.shape[0],num_classes,3))
+    for i in range(X_all_flat.shape[0]):
+        if break_label:
+            break
+        for c in range(num_classes):
+            idx = umap_class_cloud_idx[str(c)]
+            if umap_class_cloud_emb[str(c)].shape[0] == 0:
+                if i == X_all_flat.shape[0] and c == num_classes:
+                    break_label = True
+                continue
+            if idx[0] == i:
+                pos_val = umap_class_cloud_emb[str(c)][0]
+                distance_matrix[i, c, 0:2] = pos_val
+                distance_matrix[i, c, 2] = 1.
+                umap_class_cloud_idx[str(c)] = umap_class_cloud_idx[str(c)][1:]
+                umap_class_cloud_emb[str(c)] = umap_class_cloud_emb[str(c)][1:]
+                break
+            else:
+                pass
+        if not break_label:
+            idx = distance_matrix[i, :, 2] == 1.
+            idx_other = [k for k, x in enumerate(idx) if not x]
+            idx_center = [k for k, x in enumerate(idx) if x]
+            other_vals_x = [(np.abs(emb[str(k)][:,0]-distance_matrix[i, idx_center, 0])).argmin() for k in idx_other]
+            other_vals_y = [(np.abs(emb[str(k)][:,1]-distance_matrix[i, idx_center, 1])).argmin() for k in idx_other]
+            l = 0
+            for indx in idx_other:
+                distance_matrix[i, indx ,0] = emb[str(indx)][other_vals_x[l],0]
+                distance_matrix[i, indx ,1] = emb[str(indx)][other_vals_y[l],1]
+                l+=1
+        else:
+            print(umap_class_cloud_idx)
+            print(i,X_all_flat.shape[0])
+
+    with open(umap_path, "wb") as f:
+        pickle.dump(distance_matrix, f)
+    print("Computed UMAP results and saved to pickle.")
 
 
+def calculate_relative_positions(matrix: np.ndarray) -> np.ndarray:
+    if matrix.ndim != 3 or matrix.shape[1] != 5 or matrix.shape[2] != 3:
+        raise ValueError("Input matrix must be of shape (B,5,3)")
+    relative_matrix = matrix.copy()
+    ref_indices = np.argmax(relative_matrix[:, :, 2], axis=1)
+    B = relative_matrix.shape[0]
+    ref_coords = relative_matrix[np.arange(B), ref_indices, :2]
+    relative_matrix[:, :, :2] = relative_matrix[:, :, :2] - ref_coords[:, None, :]
+    return relative_matrix
+
+
+# --- Training and evaluation ---
+num_epochs = 10000
+batch_size = 32
+lead_view = 0
+seq_len = 1000
+model = ECGClassifier(num_classes, seq_len).to(device)
+print('Model Parameters: ', count_parameters(model))
+
+class_weights = torch.ones(num_classes, device=device)
+class_weights[2] = 1.1
+
+criterion_main = FocalLoss(gamma=2.0, class_weight=class_weights)
+criterion_aux = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9,0.999),
+                       eps=1e-8, weight_decay=5e-6, amsgrad=True)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)
+train_loss_history = []
+test_loss_history = []
+train_acc_history = []
+test_acc_history = []
+
+umap_coeff_train = distance_matrix[0:len(X_train_t)]
+umap_coeff_test = distance_matrix[len(X_train_t):len(X_train_t)+len(X_test_t)]
+umap_coeff_train = np.abs(calculate_relative_positions(umap_coeff_train))*1e2
+umap_coeff_test = np.abs(calculate_relative_positions(umap_coeff_test))*1e2
+D_tensor = torch.tensor(umap_coeff_train, device=device, dtype=torch.float32)
+D_tensor_test = torch.tensor(umap_coeff_test, device=device, dtype=torch.float32)
+
+start_block_time = time.time()
 for epoch in range(num_epochs):
     samples_per_class = batch_size // num_classes
     remainder = batch_size % num_classes
@@ -319,13 +332,14 @@ for epoch in range(num_epochs):
     main_logits, aux_logits = model(train_data_sample)
     main_targets = torch.argmax(train_label_sample, dim=1)
     aux_targets = torch.nn.functional.one_hot((main_targets == 2).long(), num_classes=2).float()
-    fused_train_logits = fuse_logits_dynamic(main_logits, aux_logits[:,1])
+    fused_train_logits = fuse_logits_dynamic(main_logits, aux_logits[:, 1])
     main_loss = criterion_main(fused_train_logits, main_targets)
     aux_loss = criterion_aux(aux_logits, torch.argmax(aux_targets, dim=1))
-    # UMAP extra loss: from fused logits, get predictions
     preds_train = torch.argmax(fused_train_logits, dim=1)
-    # For each sample, if prediction is wrong, add extra penalty = D_tensor[true, pred]
-    umap_loss = torch.mean(torch.where(preds_train != main_targets,D_tensor[main_targets, preds_train],torch.zeros_like(preds_train, dtype=torch.float32)))
+    batch_D_tensor = D_tensor[random_train_indices]
+    penalty_vals = torch.mean(batch_D_tensor[torch.arange(batch_D_tensor.size(0)), preds_train, :2], dim=1)
+    mask = (preds_train != main_targets).float()
+    umap_loss = torch.mean(penalty_vals * mask)
     total_loss = main_loss + aux_loss + umap_loss
     optimizer.zero_grad()
     total_loss.backward()
@@ -339,14 +353,15 @@ for epoch in range(num_epochs):
         main_test_logits, aux_test_logits = model(test_data_sample)
         test_targets = torch.argmax(test_label_sample, dim=1)
         aux_test_targets = torch.nn.functional.one_hot((test_targets == 2).long(), num_classes=2).float()
-        fused_test_logits = fuse_logits_dynamic(main_test_logits, aux_test_logits[:,1])
+        fused_test_logits = fuse_logits_dynamic(main_test_logits, aux_test_logits[:, 1])
         test_main_loss = criterion_main(fused_test_logits, test_targets)
         test_aux_loss = criterion_aux(aux_test_logits, torch.argmax(aux_test_targets, dim=1))
         preds_test = torch.argmax(fused_test_logits, dim=1)
-        umap_test_loss = torch.mean(torch.where(preds_test != test_targets,
-                                D_tensor[test_targets, preds_test],
-                                torch.zeros_like(preds_test, dtype=torch.float32)))
-        test_loss = test_main_loss + test_aux_loss + 0.1 * umap_test_loss
+        batch_test_D_tensor = D_tensor_test[random_test_indices]
+        test_penalty_vals = torch.mean(batch_test_D_tensor[torch.arange(test_data_sample.size(0)), preds_test, :2], dim=1)
+        mask_test = (preds_test != test_targets).float()
+        umap_test_loss = torch.mean(test_penalty_vals * mask_test)
+        test_loss = test_main_loss + test_aux_loss + umap_test_loss
         test_prob = fused_test_logits.softmax(dim=1)
         _, test_preds = torch.max(test_prob, dim=1)
         test_correct = (test_preds == test_targets).sum().item()
