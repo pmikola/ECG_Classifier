@@ -99,7 +99,7 @@ def ecg_umap_plot(X_train):
 def augment_data(data):
     if data.ndim == 2:
         data = data.unsqueeze(1)
-    aug = torch.randint(0, 4, (1,), device=device).item()
+    aug = torch.randint(0, 5, (1,), device=device).item()
     if aug == 0:
         noise_std = 0.01
         noise = torch.randn_like(data) * noise_std
@@ -110,6 +110,8 @@ def augment_data(data):
     elif aug == 2:
         scale = torch.empty(1, device=device).uniform_(0.9, 1.1).item()
         return data * scale
+    elif aug == 3:
+        return data
     else:
         noise_std = 0.01
         noise = torch.randn_like(data, device=device) * noise_std
@@ -182,6 +184,8 @@ else:
     y_test  = np.array(Y[Y.strat_fold == test_fold].diagnostic_superclass)
     unique_classes = np.unique(np.concatenate(Y['diagnostic_superclass'].values))
     print(unique_classes)
+    # ['CD' 'HYP' 'MI' 'NORM' 'STTC']
+    #
     num_classes = len(unique_classes)
     class_to_idx = {cls: idx for idx, cls in enumerate(unique_classes)}
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
@@ -284,13 +288,15 @@ seq_len = 1000
 model = ECGClassifier(num_classes, seq_len).to(device)
 print('Model Parameters: ', count_parameters(model))
 class_weights = torch.ones(num_classes, device=device)
-class_weights[2] = 1.1
-criterion_main = FocalLoss(gamma=2.0, class_weight=class_weights)
-criterion_aux = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9,0.999), eps=1e-8, weight_decay=5e-6, amsgrad=True)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.9)
-center_loss = CenterLoss(num_classes, 128, device)
-lambda_center = 0.1
+class_weights_2 = torch.ones(2, device=device)
+
+criterion_main = nn.CrossEntropyLoss()#FocalLoss(gamma=2.0, class_weight=class_weights)
+criterion_aux = nn.CrossEntropyLoss()#FocalLoss(gamma=2.0, class_weight=class_weights_2)#
+criterion_signals = nn.MSELoss()
+#
+optimizer = optim.Adam(list(model.parameters()), lr=1e-3, betas=(0.9,0.999), eps=1e-8, weight_decay=5e-6, amsgrad=True)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.95)
+
 train_loss_history = []
 test_loss_history = []
 train_acc_history = []
@@ -302,6 +308,7 @@ umap_coeff_test = np.abs(calculate_relative_positions(umap_coeff_test))*1e2
 D_tensor = torch.tensor(umap_coeff_train, device=device, dtype=torch.float32)
 D_tensor_test = torch.tensor(umap_coeff_test, device=device, dtype=torch.float32)
 start_block_time = time.time()
+
 for epoch in range(num_epochs):
     samples_per_class = batch_size // num_classes
     remainder = batch_size % num_classes
@@ -320,35 +327,29 @@ for epoch in range(num_epochs):
     random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:batch_size]
     train_data_sample = X_train_t[random_train_indices, :, lead_view]
     train_label_sample = y_train_t[random_train_indices]
+    train_data_signal_sample = X_train_t[random_train_indices, :]
+
     train_data_sample = augment_data(train_data_sample)
     test_data_sample = X_test_t[random_test_indices, :, lead_view]
     test_label_sample = y_test_t[random_test_indices]
+    test_data_signal_sample = X_test_t[random_test_indices, :]
+
     model.train()
-    outputs = model(train_data_sample)
-    if isinstance(outputs, tuple) and len(outputs) == 3:
-        main_logits, aux_logits, features = outputs
-    else:
-        main_logits, aux_logits = outputs
-        features = None
+    main_logits, aux_logits, features = model(train_data_sample)
+    features = augment_data(features)
     main_targets = torch.argmax(train_label_sample, dim=1)
     aux_targets = torch.nn.functional.one_hot((main_targets == 2).long(), num_classes=2).float()
     fused_train_logits = fuse_logits_dynamic(main_logits, aux_logits[:, 1])
     main_loss = criterion_main(fused_train_logits, main_targets)
+
     aux_loss = criterion_aux(aux_logits, torch.argmax(aux_targets, dim=1))
+    signal_loss = criterion_signals(features, train_data_signal_sample)
     preds_train = torch.argmax(fused_train_logits, dim=1)
     batch_D_tensor = D_tensor[random_train_indices]
     penalty_vals = torch.mean(batch_D_tensor[torch.arange(batch_D_tensor.size(0)), preds_train, :2], dim=1)
     mask = (preds_train != main_targets).float()
     umap_loss = torch.mean(penalty_vals * mask)
-    if features is not None:
-        sttc_idx = (main_targets == 2)
-        if sttc_idx.sum() > 0:
-            center_loss_val = center_loss(features[sttc_idx], main_targets[sttc_idx])
-        else:
-            center_loss_val = torch.tensor(0.0, device=device)
-    else:
-        center_loss_val = torch.tensor(0.0, device=device)
-    total_loss = main_loss + aux_loss + umap_loss + lambda_center * center_loss_val
+    total_loss = (main_loss +aux_loss +signal_loss)*(1+umap_loss)
     optimizer.zero_grad()
     total_loss.backward()
     optimizer.step()
@@ -358,12 +359,7 @@ for epoch in range(num_epochs):
     train_acc = train_correct / main_targets.size(0)
     model.eval()
     with torch.no_grad():
-        outputs_test = model(test_data_sample)
-        if isinstance(outputs_test, tuple) and len(outputs_test) == 3:
-            main_test_logits, aux_test_logits, test_features = outputs_test
-        else:
-            main_test_logits, aux_test_logits = outputs_test
-            test_features = None
+        main_test_logits, aux_test_logits, test_features = model(test_data_sample)
         test_targets = torch.argmax(test_label_sample, dim=1)
         aux_test_targets = torch.nn.functional.one_hot((test_targets == 2).long(), num_classes=2).float()
         fused_test_logits = fuse_logits_dynamic(main_test_logits, aux_test_logits[:, 1])
@@ -374,7 +370,8 @@ for epoch in range(num_epochs):
         test_penalty_vals = torch.mean(batch_test_D_tensor[torch.arange(test_data_sample.size(0)), preds_test, :2], dim=1)
         mask_test = (preds_test != test_targets).float()
         umap_test_loss = torch.mean(test_penalty_vals * mask_test)
-        test_loss = test_main_loss + test_aux_loss + umap_test_loss
+        test_signal_loss = criterion_signals(test_features, test_data_signal_sample)
+        test_loss = (test_main_loss + test_aux_loss +test_signal_loss)*(1+ umap_test_loss)
         test_prob = fused_test_logits.softmax(dim=1)
         _, test_preds = torch.max(test_prob, dim=1)
         test_correct = (test_preds == test_targets).sum().item()
@@ -417,11 +414,7 @@ with torch.no_grad():
     random_test_indices = torch.randperm(X_test_t.shape[0], device=device)[:1000]
     test_data_sample = X_test_t[random_test_indices, :, lead_view]
     test_label_sample = y_test_t[random_test_indices]
-    outputs_final = model(test_data_sample)
-    if isinstance(outputs_final, tuple) and len(outputs_final) == 3:
-        main_test_logits, aux_test_logits, _ = outputs_final
-    else:
-        main_test_logits, aux_test_logits = outputs_final
+    main_test_logits, aux_test_logits, _ = model(test_data_sample)
     fused_final_logits = fuse_logits_dynamic(main_test_logits, aux_test_logits[:,1])
     final_prob = fused_final_logits.softmax(dim=1)
     _, preds_full = torch.max(final_prob, dim=1)
