@@ -281,7 +281,7 @@ def calculate_relative_positions(matrix: np.ndarray) -> np.ndarray:
     relative_matrix[:, :, :2] = relative_matrix[:, :, :2] - ref_coords[:, None, :]
     return relative_matrix
 
-num_epochs = 10000
+num_epochs = 200
 batch_size = 32
 lead_view = 0
 seq_len = 1000
@@ -388,7 +388,19 @@ for epoch in range(num_epochs):
         print(f"[{epoch:04d}/{num_epochs}] Total Loss: {total_loss.item():.4f} | Test Loss: {test_loss.item():.4f} | Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f} | Mean Time/Epoch: {mean_block_time:.3f}s")
         start_block_time = time.time()
     scheduler.step()
-
+dummy_input = torch.randn(1, seq_len, device=device)
+torch.onnx.export(
+    model,
+    (dummy_input,),
+    "ecg_classifier_stm32.onnx",
+    export_params=True,
+    opset_version=12,
+    do_constant_folding=True,
+    input_names=["ecg_signal"],
+    output_names=["main_logits",
+                  "aux_logits",
+                  "features"],
+)
 plt.style.use('dark_background')
 fig, axs = plt.subplots(1, 2, figsize=(8, 4))
 axs[0].plot(train_loss_history, label='Train Loss')
